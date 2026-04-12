@@ -89,6 +89,11 @@ type DockerConfiguration struct {
 	// remapping disabled
 	UsernsMode string `default:"" json:"userns_mode" yaml:"userns_mode"`
 
+	// WritableRootfs controls whether the container's root filesystem is writable.
+	// By default this is false (read-only rootfs) for security. Set to true to allow
+	// users to install packages via apt inside their containers.
+	WritableRootfs bool `default:"false" json:"writable_rootfs" yaml:"writable_rootfs"`
+
 	// Sets the IPS that the user is able to bind to
 	SystemIps []string `default:"[]" json:"system_ips" yaml:"system_ips"`
 

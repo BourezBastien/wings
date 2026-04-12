@@ -260,7 +260,7 @@ func (e *Environment) Create() error {
 		LogConfig: cfg.Docker.ContainerLogConfig(),
 
 		SecurityOpt:    []string{"no-new-privileges"},
-		ReadonlyRootfs: true,
+		ReadonlyRootfs: !config.Get().Docker.WritableRootfs,
 		CapDrop: []string{
 			"setpcap", "mknod", "audit_write", "net_raw", "dac_override",
 			"fowner", "fsetid", "net_bind_service", "sys_chroot", "setfcap",

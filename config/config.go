@@ -74,7 +74,7 @@ type SftpConfiguration struct {
 	// If set to true, SSH shell access will be enabled alongside SFTP.
 	ShellEnabled bool `default:"true" yaml:"shell_enabled"`
 	// The shell path to use for SSH sessions inside containers.
-	ShellPath string `default:"/bin/sh" yaml:"shell_path"`
+	ShellPath string `default:"/bin/bash" yaml:"shell_path"`
 }
 
 // ApiConfiguration defines the configuration for the internal API that is
@@ -676,7 +676,7 @@ func ConfigurePasswd() (err error) {
 	log.WithField("filepath", filepath.Join(_config.System.User.Passwd.Directory, "passwd")).
 		Debug("ensuring passwd file exists")
 	if err = os.WriteFile(filepath.Join(_config.System.User.Passwd.Directory, "passwd"),
-		[]byte(fmt.Sprintf("container:x:%d:%d::/home/container:/usr/sbin/nologin",
+		[]byte(fmt.Sprintf("container:x:%d:%d::/home/container:/bin/bash",
 			_config.System.User.Uid, _config.System.User.Gid)), 0644); err != nil {
 		return fmt.Errorf("could not write passwd file: %w", err)
 	}
