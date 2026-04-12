@@ -1,22 +1,21 @@
-FROM ghcr.io/parkervcp/yolks:debian
+FROM debian:bookworm-slim
 
-# Install useful tools
+# Install minimal useful tools + sudo in one layer
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     curl \
     wget \
     unzip \
     git \
-    bash \
     sudo \
-    ca-certificates \
-    gnupg \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
-# Configure passwordless sudo for the container user
-RUN echo "container ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/container \
+# Create container user with bash shell (UID/GID set by Wings via passwd mount)
+RUN useradd -m -s /bin/bash container \
+    && echo "container ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/container \
     && chmod 0440 /etc/sudoers.d/container
 
-# Set bash as default shell
-RUN chsh -s /bin/bash container 2>/dev/null || true
-
+USER container
+WORKDIR /home/container
 CMD ["/bin/bash"]
