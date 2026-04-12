@@ -17,3 +17,17 @@ func (s *Server) Sftp() *system.ContextBag {
 
 	return s.sftpBag
 }
+
+// Shell returns the SSH shell connection bag for the server instance. This bag tracks
+// all open SSH shell sessions by individual user and allows for a single user or
+// all users to be disconnected by other processes.
+func (s *Server) Shell() *system.ContextBag {
+	s.Lock()
+	defer s.Unlock()
+
+	if s.shellBag == nil {
+		s.shellBag = system.NewContextBag(s.Context())
+	}
+
+	return s.shellBag
+}

@@ -71,6 +71,10 @@ type SftpConfiguration struct {
 	ReadOnly bool `default:"false" yaml:"read_only"`
 	// If set to true users won't be able to login using their password.
 	KeyOnly bool `default:"false" yaml:"key_only"`
+	// If set to true, SSH shell access will be enabled alongside SFTP.
+	ShellEnabled bool `default:"true" yaml:"shell_enabled"`
+	// The shell path to use for SSH sessions inside containers.
+	ShellPath string `default:"/bin/sh" yaml:"shell_path"`
 }
 
 // ApiConfiguration defines the configuration for the internal API that is

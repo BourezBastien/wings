@@ -138,22 +138,71 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 			continue
 		}
 
-		go func(in <-chan *ssh.Request) {
-			for req := range in {
-				// Channels have a type that is dependent on the protocol. For SFTP
-				// this is "subsystem" with a payload that (should) be "sftp". Discard
-				// anything else we receive ("pty", "shell", etc)
-				_ = req.Reply(req.Type == "subsystem" && string(req.Payload[4:]) == "sftp", nil)
-			}
-		}(requests)
+		// sessionState tracks the type of session being requested (SFTP vs shell)
+		// and PTY dimensions for shell sessions.
+		type sessionState struct {
+			isShell bool
+			isSftp  bool
+			cols    uint32
+			rows    uint32
+		}
 
-		if srv, ok := c.manager.Get(sconn.Permissions.Extensions["uuid"]); ok {
+		state := &sessionState{}
+		sessionReady := make(chan struct{})
+
+		// Handle SSH requests for this channel to determine session type.
+		go func(in <-chan *ssh.Request, st *sessionState) {
+			defer close(sessionReady)
+			for req := range in {
+				switch req.Type {
+				case "subsystem":
+					if string(req.Payload[4:]) == "sftp" {
+						st.isSftp = true
+						_ = req.Reply(true, nil)
+						return
+					}
+					_ = req.Reply(false, nil)
+				case "pty-req":
+					st.cols, st.rows = parsePtyDimensions(req.Payload)
+					_ = req.Reply(true, nil)
+				case "shell":
+					st.isShell = true
+					_ = req.Reply(true, nil)
+					return
+				case "window-change":
+					_ = req.Reply(true, nil)
+				default:
+					_ = req.Reply(false, nil)
+				}
+			}
+		}(requests, state)
+
+		// Wait until the session type is determined.
+		<-sessionReady
+
+		srv, ok := c.manager.Get(sconn.Permissions.Extensions["uuid"])
+		if !ok {
+			continue
+		}
+
+		if state.isShell {
+			if err := c.HandleShell(sconn, srv, channel, state.cols, state.rows); err != nil {
+				return err
+			}
+		} else if state.isSftp {
 			if err := c.Handle(sconn, srv, channel); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// HandleShell creates an interactive SSH shell session inside the server's container
+// using Docker exec with PTY allocation.
+func (c *SFTPServer) HandleShell(conn *ssh.ServerConn, srv *server.Server, channel ssh.Channel, cols, rows uint32) error {
+	handler := NewShellHandler(conn, srv, channel)
+	return handler.Handle(srv.Context(), cols, rows)
 }
 
 // Handle spins up a SFTP server instance for the authenticated user's server allowing

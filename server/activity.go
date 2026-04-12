@@ -14,6 +14,8 @@ const ActivityPowerPrefix = "server:power."
 
 const (
 	ActivityConsoleCommand      = models.Event("server:console.command")
+	ActivitySSHSessionStart     = models.Event("server:ssh.session.start")
+	ActivitySSHSessionEnd       = models.Event("server:ssh.session.end")
 	ActivitySftpWrite           = models.Event("server:sftp.write")
 	ActivitySftpCreate          = models.Event("server:sftp.create")
 	ActivitySftpCreateDirectory = models.Event("server:sftp.create-directory")

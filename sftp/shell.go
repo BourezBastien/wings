@@ -1,0 +1,234 @@
+package sftp
+
+import (
+	"context"
+	"encoding/binary"
+	"io"
+	"strings"
+	"sync"
+	"time"
+
+	"emperror.dev/errors"
+	"github.com/apex/log"
+	dockerContainer "github.com/docker/docker/api/types/container"
+	"golang.org/x/crypto/ssh"
+
+	"github.com/pelican-dev/wings/config"
+	dockerEnv "github.com/pelican-dev/wings/environment/docker"
+	"github.com/pelican-dev/wings/environment"
+	"github.com/pelican-dev/wings/internal/database"
+	"github.com/pelican-dev/wings/internal/models"
+	"github.com/pelican-dev/wings/server"
+)
+
+const PermissionTerminalSSH = "terminal.ssh"
+
+// ShellHandler handles an interactive SSH shell session by creating a Docker exec
+// instance with PTY allocation inside the server's container.
+type ShellHandler struct {
+	mu          sync.Mutex
+	srv         *server.Server
+	conn        *ssh.ServerConn
+	channel     ssh.Channel
+	permissions []string
+	logger      *log.Entry
+}
+
+// NewShellHandler creates a new SSH shell session handler.
+func NewShellHandler(sc *ssh.ServerConn, srv *server.Server, channel ssh.Channel) *ShellHandler {
+	uuid, _ := sc.Permissions.Extensions["user"]
+	return &ShellHandler{
+		srv:         srv,
+		conn:        sc,
+		channel:     channel,
+		permissions: strings.Split(sc.Permissions.Extensions["permissions"], ","),
+		logger: log.WithFields(log.Fields{
+			"subsystem": "ssh-shell",
+			"user":      uuid,
+			"ip":        sc.RemoteAddr(),
+			"server":    srv.ID(),
+		}),
+	}
+}
+
+// can checks if the user has the specified permission.
+func (h *ShellHandler) can(permission string) bool {
+	if h.srv.IsSuspended() {
+		return false
+	}
+	for _, p := range h.permissions {
+		if p == permission || p == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+// logActivity logs an SSH session event to the activity database.
+func (h *ShellHandler) logActivity(event models.Event, metadata map[string]interface{}) {
+	a := models.Activity{
+		Server:   h.srv.ID(),
+		Event:    event,
+		Metadata: metadata,
+		IP:       h.conn.RemoteAddr().String(),
+	}
+	user, _ := h.conn.Permissions.Extensions["user"]
+	if tx := database.Instance().Create(a.SetUser(user)); tx.Error != nil {
+		h.logger.WithField("error", tx.Error).WithField("event", event).Error("ssh-shell: failed to log activity event")
+	}
+}
+
+// Handle manages the full lifecycle of an SSH shell session:
+//  1. Validate permissions and server state
+//  2. Create a Docker exec instance with TTY
+//  3. Pipe I/O between SSH channel and Docker exec
+//  4. Handle PTY resize requests
+//  5. Clean up on disconnect
+func (h *ShellHandler) Handle(ctx context.Context, initialCols, initialRows uint32) error {
+	// Check if shell access is globally enabled.
+	if !config.Get().System.Sftp.ShellEnabled {
+		h.logger.Warn("ssh-shell: shell access is disabled in Wings configuration")
+		_, _ = h.channel.Write([]byte("shell access is disabled\r\n"))
+		_ = h.channel.Close()
+		return nil
+	}
+
+	// Check user permission.
+	if !h.can(PermissionTerminalSSH) {
+		h.logger.Warn("ssh-shell: user does not have terminal.ssh permission")
+		_, _ = h.channel.Write([]byte("permission denied\r\n"))
+		_ = h.channel.Close()
+		return nil
+	}
+
+	// Verify the server is running.
+	if !h.srv.IsRunning() {
+		h.logger.Warn("ssh-shell: server is not running")
+		_, _ = h.channel.Write([]byte("server is not running\r\n"))
+		_ = h.channel.Close()
+		return nil
+	}
+
+	// Get the Docker client and container ID.
+	env, ok := h.srv.Environment.(*dockerEnv.Environment)
+	if !ok {
+		return errors.New("ssh-shell: environment is not Docker")
+	}
+
+	cli, err := environment.Docker()
+	if err != nil {
+		return errors.Wrap(err, "ssh-shell: failed to get Docker client")
+	}
+
+	containerID := env.Id
+
+	shellPath := config.Get().System.Sftp.ShellPath
+
+	// Log session start.
+	h.logActivity(server.ActivitySSHSessionStart, map[string]interface{}{
+		"shell": shellPath,
+	})
+
+	startTime := time.Now()
+	h.logger.Info("ssh-shell: session started")
+
+	// Register session in connection bag for tracking and cleanup.
+	user, _ := h.conn.Permissions.Extensions["user"]
+	shellCtx := h.srv.Shell().Context(user)
+	defer h.srv.Shell().Cancel(user)
+
+	// Create Docker exec instance with TTY.
+	execConfig := dockerContainer.ExecOptions{
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          true,
+		Cmd:          []string{shellPath},
+		WorkingDir:   "/home/container",
+	}
+
+	execCreateResp, err := cli.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return errors.Wrap(err, "ssh-shell: failed to create exec instance")
+	}
+
+	// Attach to the exec instance.
+	execAttachResp, err := cli.ContainerExecAttach(ctx, execCreateResp.ID, dockerContainer.ExecAttachOptions{
+		Tty:    true,
+		Detach: false,
+	})
+	if err != nil {
+		return errors.Wrap(err, "ssh-shell: failed to attach to exec instance")
+	}
+	defer execAttachResp.Close()
+
+	// Set initial PTY size.
+	if initialCols > 0 && initialRows > 0 {
+		_ = cli.ContainerExecResize(ctx, execCreateResp.ID, dockerContainer.ResizeOptions{
+			Height: uint(initialRows),
+			Width:  uint(initialCols),
+		})
+	}
+
+	// Set up context for clean shutdown derived from the shell connection bag.
+	// This allows the server to cancel all shell sessions on stop.
+	sessionCtx, sessionCancel := context.WithCancel(shellCtx)
+	defer sessionCancel()
+
+	var once sync.Once
+	closeSession := func() {
+		once.Do(sessionCancel)
+	}
+
+	// Goroutine: SSH channel stdin -> Docker exec stdin
+	go func() {
+		defer closeSession()
+		_, _ = io.Copy(execAttachResp.Conn, h.channel)
+	}()
+
+	// Goroutine: Docker exec stdout -> SSH channel stdout
+	go func() {
+		defer closeSession()
+		_, _ = io.Copy(h.channel, execAttachResp.Reader)
+	}()
+
+	// Wait for session to end (context cancelled by either goroutine).
+	<-sessionCtx.Done()
+
+	// Log session end.
+	duration := time.Since(startTime)
+	h.logActivity(server.ActivitySSHSessionEnd, map[string]interface{}{
+		"duration_ms": duration.Milliseconds(),
+	})
+	h.logger.WithField("duration", duration).Info("ssh-shell: session ended")
+
+	return nil
+}
+
+// parsePtyDimensions parses the PTY request payload to extract columns and rows.
+// The SSH PTY request payload format is:
+//   uint32  terminal-width (columns)
+//   uint32  terminal-height (rows)
+//   uint32  terminal-width-pixels
+//   uint32  terminal-height-pixels
+//   string  terminal-mode
+func parsePtyDimensions(payload []byte) (cols, rows uint32) {
+	if len(payload) < 8 {
+		return 80, 24 // default fallback
+	}
+	cols = binary.BigEndian.Uint32(payload[0:4])
+	rows = binary.BigEndian.Uint32(payload[4:8])
+	if cols == 0 {
+		cols = 80
+	}
+	if rows == 0 {
+		rows = 24
+	}
+	return
+}
+
+// parseWindowChange parses a window-change request payload.
+// Same format as PTY dimensions (first 8 bytes).
+func parseWindowChange(payload []byte) (cols, rows uint32) {
+	return parsePtyDimensions(payload)
+}

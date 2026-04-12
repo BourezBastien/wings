@@ -71,6 +71,7 @@ type Server struct {
 	throttler    *ConsoleThrottle
 	throttleOnce sync.Once
 	sftpBag      *system.ContextBag
+	shellBag     *system.ContextBag
 
 	// Tracks open websocket connections for the server.
 	wsBag       *WebsocketBag
