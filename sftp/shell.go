@@ -23,6 +23,12 @@ import (
 
 const PermissionTerminalSSH = "terminal.ssh"
 
+// resizeEvent carries PTY dimension changes from SSH window-change requests.
+type resizeEvent struct {
+	cols uint32
+	rows uint32
+}
+
 // ShellHandler handles an interactive SSH shell session by creating a Docker exec
 // instance with PTY allocation inside the server's container.
 type ShellHandler struct {
@@ -82,9 +88,9 @@ func (h *ShellHandler) logActivity(event models.Event, metadata map[string]inter
 //  1. Validate permissions and server state
 //  2. Create a Docker exec instance with TTY
 //  3. Pipe I/O between SSH channel and Docker exec
-//  4. Handle PTY resize requests
+//  4. Handle PTY resize requests via resizeCh
 //  5. Clean up on disconnect
-func (h *ShellHandler) Handle(ctx context.Context, initialCols, initialRows uint32) error {
+func (h *ShellHandler) Handle(ctx context.Context, initialCols, initialRows uint32, resizeCh <-chan resizeEvent) error {
 	// Check if shell access is globally enabled.
 	if !config.Get().System.Sftp.ShellEnabled {
 		h.logger.Warn("ssh-shell: shell access is disabled in Wings configuration")
@@ -190,6 +196,16 @@ func (h *ShellHandler) Handle(ctx context.Context, initialCols, initialRows uint
 	go func() {
 		defer closeSession()
 		_, _ = io.Copy(h.channel, execAttachResp.Reader)
+	}()
+
+	// Goroutine: handle PTY resize events from SSH window-change requests.
+	go func() {
+		for ev := range resizeCh {
+			_ = cli.ContainerExecResize(ctx, execCreateResp.ID, dockerContainer.ResizeOptions{
+				Height: uint(ev.rows),
+				Width:  uint(ev.cols),
+			})
+		}
 	}()
 
 	// Wait for session to end (context cancelled by either goroutine).
