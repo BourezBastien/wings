@@ -327,13 +327,13 @@ func (h *ShellHandler) HandleExec(ctx context.Context, cmd string) error {
 	startTime := time.Now()
 	h.logger.WithField("cmd", cmd).Info("ssh-exec: running command")
 
-	// Use bash -c to support pipes, redirects, etc.
+	// Use sh -c with TTY for proper bidirectional I/O (required by VS Code Remote SSH).
 	execConfig := dockerContainer.ExecOptions{
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
-		Tty:          false,
-		Cmd:          []string{"/bin/bash", "-c", cmd},
+		Tty:          true,
+		Cmd:          []string{"/bin/sh", "-c", cmd},
 		WorkingDir:   "/home/container",
 	}
 
@@ -343,7 +343,7 @@ func (h *ShellHandler) HandleExec(ctx context.Context, cmd string) error {
 	}
 
 	execAttachResp, err := cli.ContainerExecAttach(ctx, execCreateResp.ID, dockerContainer.ExecAttachOptions{
-		Tty:    false,
+		Tty:    true,
 		Detach: false,
 	})
 	if err != nil {
@@ -355,16 +355,18 @@ func (h *ShellHandler) HandleExec(ctx context.Context, cmd string) error {
 	stdoutDone := make(chan struct{})
 	stdinDone := make(chan struct{})
 
-	// Docker exec stdout/stderr -> SSH channel
+	// Docker exec stdout -> SSH channel
 	go func() {
 		defer close(stdoutDone)
-		io.Copy(h.channel, execAttachResp.Reader)
+		n, _ := io.Copy(h.channel, execAttachResp.Reader)
+		h.logger.WithField("bytes_out", n).Debug("ssh-exec: stdout copy done")
 	}()
 
 	// SSH channel stdin -> Docker exec stdin
 	go func() {
 		defer close(stdinDone)
-		io.Copy(execAttachResp.Conn, h.channel)
+		n, _ := io.Copy(execAttachResp.Conn, h.channel)
+		h.logger.WithField("bytes_in", n).Debug("ssh-exec: stdin copy done")
 		// Signal EOF to the container process so it knows stdin is closed.
 		if cw, ok := execAttachResp.Conn.(interface{ CloseWrite() error }); ok {
 			cw.CloseWrite()
