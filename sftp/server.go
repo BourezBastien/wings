@@ -184,7 +184,7 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 					st.isExec = true
 					_ = req.Reply(true, nil)
 					close(sessionReady)
-					return
+					// Do NOT return - keep draining requests (signal, etc.) for VS Code Remote SSH
 				case "window-change":
 					cols, rows := parseWindowChange(req.Payload)
 					_ = req.Reply(true, nil)
@@ -194,6 +194,9 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 						default:
 						}
 					}
+				case "signal":
+					// Accept signal requests from clients like VS Code.
+					_ = req.Reply(true, nil)
 				default:
 					_ = req.Reply(false, nil)
 				}

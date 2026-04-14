@@ -365,6 +365,10 @@ func (h *ShellHandler) HandleExec(ctx context.Context, cmd string) error {
 	go func() {
 		defer close(stdinDone)
 		io.Copy(execAttachResp.Conn, h.channel)
+		// Signal EOF to the container process so it knows stdin is closed.
+		if cw, ok := execAttachResp.Conn.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		}
 	}()
 
 	// Wait for stdout to finish (command completed)
@@ -373,14 +377,19 @@ func (h *ShellHandler) HandleExec(ctx context.Context, cmd string) error {
 	// Close docker exec stdin to signal we're done
 	execAttachResp.Close()
 
-	// Inspect the exec to get the exit code
+	// Poll for the exec exit code (it may still be running briefly after stdout closes).
 	var exitCode int
-	inspectResp, err := cli.ContainerExecInspect(ctx, execCreateResp.ID)
-	if err != nil {
-		h.logger.WithField("error", err).Warn("ssh-exec: failed to inspect exec for exit code")
-		exitCode = 0
-	} else {
-		exitCode = inspectResp.ExitCode
+	for i := 0; i < 10; i++ {
+		inspectResp, err := cli.ContainerExecInspect(ctx, execCreateResp.ID)
+		if err != nil {
+			h.logger.WithField("error", err).Warn("ssh-exec: failed to inspect exec for exit code")
+			break
+		}
+		if !inspectResp.Running {
+			exitCode = inspectResp.ExitCode
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Send exit status to the SSH client (required by VS Code Remote SSH)
