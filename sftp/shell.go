@@ -14,8 +14,8 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/pelican-dev/wings/config"
-	dockerEnv "github.com/pelican-dev/wings/environment/docker"
 	"github.com/pelican-dev/wings/environment"
+	dockerEnv "github.com/pelican-dev/wings/environment/docker"
 	"github.com/pelican-dev/wings/internal/database"
 	"github.com/pelican-dev/wings/internal/models"
 	"github.com/pelican-dev/wings/server"
@@ -351,26 +351,48 @@ func (h *ShellHandler) HandleExec(ctx context.Context, cmd string) error {
 	}
 	defer execAttachResp.Close()
 
-	// Pipe I/O — for non-TTY, stdout and stderr are separate streams.
-	done := make(chan struct{})
+	// Pipe I/O between SSH channel and Docker exec.
+	stdoutDone := make(chan struct{})
+	stdinDone := make(chan struct{})
 
+	// Docker exec stdout/stderr -> SSH channel
 	go func() {
-		defer close(done)
+		defer close(stdoutDone)
 		io.Copy(h.channel, execAttachResp.Reader)
 	}()
 
+	// SSH channel stdin -> Docker exec stdin
 	go func() {
+		defer close(stdinDone)
 		io.Copy(execAttachResp.Conn, h.channel)
 	}()
 
-	<-done
+	// Wait for stdout to finish (command completed)
+	<-stdoutDone
+
+	// Close docker exec stdin to signal we're done
+	execAttachResp.Close()
+
+	// Inspect the exec to get the exit code
+	var exitCode int
+	inspectResp, err := cli.ContainerExecInspect(ctx, execCreateResp.ID)
+	if err != nil {
+		h.logger.WithField("error", err).Warn("ssh-exec: failed to inspect exec for exit code")
+		exitCode = 0
+	} else {
+		exitCode = inspectResp.ExitCode
+	}
+
+	// Send exit status to the SSH client (required by VS Code Remote SSH)
+	_, _ = h.channel.SendRequest("exit-status", false, ssh.Marshal(struct{ ExitStatus uint32 }{ExitStatus: uint32(exitCode)}))
+	_ = h.channel.Close()
 
 	duration := time.Since(startTime)
 	h.logActivity(server.ActivitySSHSessionEnd, map[string]interface{}{
 		"duration_ms": duration.Milliseconds(),
 		"exec":        cmd,
 	})
-	h.logger.WithField("duration", duration).WithField("cmd", cmd).Info("ssh-exec: command completed")
+	h.logger.WithField("duration", duration).WithField("cmd", cmd).WithField("exit_code", exitCode).Info("ssh-exec: command completed")
 
 	return nil
 }
