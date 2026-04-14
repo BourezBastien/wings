@@ -12,16 +12,17 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	dockerContainer "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ed25519"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/sys/unix"
 
 	"github.com/pelican-dev/wings/config"
 	"github.com/pelican-dev/wings/environment"
@@ -364,8 +365,8 @@ func (c *SFTPServer) PrivateKeyPath() string {
 
 // handleDirectTCPIP handles SSH direct-tcpip channel requests for port forwarding.
 // This is required by VS Code Remote SSH to connect to the VS Code server running
-// inside the container. It uses Docker exec to create a TCP connection inside
-// the container's network namespace.
+// inside the container. It enters the container's network namespace using setns(2)
+// and makes a direct TCP connection from Wings, avoiding Docker exec entirely.
 func (c *SFTPServer) handleDirectTCPIP(sconn *ssh.ServerConn, ch ssh.NewChannel) {
 	// Parse the direct-tcpip payload per RFC 4254:
 	// string host to connect to, uint32 port, string originator IP, uint32 originator port
@@ -422,67 +423,74 @@ func (c *SFTPServer) handleDirectTCPIP(sconn *ssh.ServerConn, ch ssh.NewChannel)
 	containerID := env.Id
 	target := fmt.Sprintf("%s:%d", req.Host, req.Port)
 
-	// Use Docker exec with TTY mode for a clean raw TCP relay.
-	// TTY mode avoids Docker's 8-byte multiplexed stream headers which can
-	// corrupt binary data and cause HTTP/WebSocket connections to fail.
-	// Try methods in order: nc (most compatible), bash /dev/tcp (Debian/Ubuntu).
-	relays := []struct {
-		cmd []string
-	}{
-		{[]string{"nc", req.Host, strconv.Itoa(int(req.Port))}},
-		{[]string{"/bin/bash", "-c", fmt.Sprintf("exec 3<>/dev/tcp/%s/%d; cat <&3 & cat >&3; wait", req.Host, req.Port)}},
-	}
-
-	var execAttachResp types.HijackedResponse
-	var success bool
-
-	for _, relay := range relays {
-		execConfig := dockerContainer.ExecOptions{
-			AttachStdin:  true,
-			AttachStdout: true,
-			AttachStderr: false,
-			Tty:          true, // Always use TTY for raw TCP relay
-			Cmd:          relay.cmd,
-		}
-
-		execCreateResp, err := cli.ContainerExecCreate(context.Background(), containerID, execConfig)
-		if err != nil {
-			log.WithField("error", err).WithField("cmd", relay.cmd).Debug("sftp: port forward exec method failed")
-			continue
-		}
-
-		execAttachResp, err = cli.ContainerExecAttach(context.Background(), execCreateResp.ID, dockerContainer.ExecAttachOptions{
-			Detach: false,
-		})
-		if err != nil {
-			log.WithField("error", err).WithField("cmd", relay.cmd).Debug("sftp: port forward attach method failed")
-			continue
-		}
-
-		log.WithField("target", target).WithField("method", relay.cmd[0]).Info("sftp: port forwarding established")
-		success = true
-		break
-	}
-
-	if !success {
-		log.WithField("target", target).Error("sftp: all port forwarding methods failed")
+	// Get the container's PID to enter its network namespace.
+	inspectResp, err := cli.ContainerInspect(context.Background(), containerID)
+	if err != nil {
+		log.WithField("error", err).WithField("target", target).Warn("sftp: failed to inspect container for port forwarding")
 		return
 	}
-	defer execAttachResp.Close()
+	if inspectResp.State == nil || inspectResp.State.Pid == 0 {
+		log.WithField("target", target).Warn("sftp: container not running, cannot forward")
+		return
+	}
 
-	// TTY mode: raw byte stream, pipe bidirectionally with io.Copy.
+	pidStr := strconv.Itoa(inspectResp.State.Pid)
+
+	// Lock this goroutine to its OS thread - network namespace switching is per-thread.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Open the container's network namespace.
+	containerNsFd, err := unix.Open("/proc/"+pidStr+"/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		log.WithField("error", err).WithField("pid", pidStr).Warn("sftp: failed to open container netns")
+		return
+	}
+	defer unix.Close(containerNsFd)
+
+	// Save the current (host) network namespace so we can restore it.
+	hostNsFd, err := unix.Open("/proc/self/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		log.WithField("error", err).Warn("sftp: failed to open host netns")
+		return
+	}
+	defer unix.Close(hostNsFd)
+
+	// Switch to the container's network namespace.
+	if err := unix.Setns(containerNsFd, unix.CLONE_NEWNET); err != nil {
+		log.WithField("error", err).Warn("sftp: failed to enter container netns")
+		return
+	}
+
+	// Make a direct TCP connection to 127.0.0.1:PORT inside the container's network.
+	conn, err := net.DialTimeout("tcp", target, 5*time.Second)
+
+	// Immediately restore the host network namespace, regardless of whether Dial succeeded.
+	if restoreErr := unix.Setns(hostNsFd, unix.CLONE_NEWNET); restoreErr != nil {
+		log.WithField("error", restoreErr).Error("sftp: CRITICAL - failed to restore host netns")
+	}
+
+	if err != nil {
+		log.WithField("error", err).WithField("target", target).Warn("sftp: failed to connect to target in container")
+		return
+	}
+	defer conn.Close()
+
+	log.WithField("target", target).WithField("pid", pidStr).Info("sftp: port forwarding established (netns)")
+
+	// Pipe data bidirectionally between SSH channel and TCP connection.
 	done := make(chan struct{})
 
-	// Docker exec stdout -> SSH channel
+	// TCP connection -> SSH channel
 	go func() {
-		io.Copy(channel, execAttachResp.Reader)
+		io.Copy(channel, conn)
 		close(done)
 	}()
 
-	// SSH channel -> Docker exec stdin
+	// SSH channel -> TCP connection
 	go func() {
-		io.Copy(execAttachResp.Conn, channel)
-		execAttachResp.Close()
+		io.Copy(conn, channel)
+		conn.Close()
 	}()
 
 	<-done
