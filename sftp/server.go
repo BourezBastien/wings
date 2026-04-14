@@ -19,7 +19,6 @@ import (
 	"github.com/apex/log"
 	dockerContainer "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ed25519"
 	"golang.org/x/crypto/ssh"
@@ -423,19 +422,18 @@ func (c *SFTPServer) handleDirectTCPIP(sconn *ssh.ServerConn, ch ssh.NewChannel)
 	containerID := env.Id
 	target := fmt.Sprintf("%s:%d", req.Host, req.Port)
 
-	// Try multiple approaches for TCP relay inside the container.
-	// Approach 1: nc (netcat) - most reliable for raw TCP relay.
-	// Approach 2: bash /dev/tcp - works on Debian/Ubuntu containers.
+	// Use Docker exec with TTY mode for a clean raw TCP relay.
+	// TTY mode avoids Docker's 8-byte multiplexed stream headers which can
+	// corrupt binary data and cause HTTP/WebSocket connections to fail.
+	// Try methods in order: nc (most compatible), bash /dev/tcp (Debian/Ubuntu).
 	relays := []struct {
 		cmd []string
-		tty bool
 	}{
-		{[]string{"nc", req.Host, strconv.Itoa(int(req.Port))}, false},
-		{[]string{"/bin/bash", "-c", fmt.Sprintf("exec 3<>/dev/tcp/%s/%d; cat <&3 & cat >&3; wait", req.Host, req.Port)}, true},
+		{[]string{"nc", req.Host, strconv.Itoa(int(req.Port))}},
+		{[]string{"/bin/bash", "-c", fmt.Sprintf("exec 3<>/dev/tcp/%s/%d; cat <&3 & cat >&3; wait", req.Host, req.Port)}},
 	}
 
 	var execAttachResp types.HijackedResponse
-	var usedTty bool
 	var success bool
 
 	for _, relay := range relays {
@@ -443,7 +441,7 @@ func (c *SFTPServer) handleDirectTCPIP(sconn *ssh.ServerConn, ch ssh.NewChannel)
 			AttachStdin:  true,
 			AttachStdout: true,
 			AttachStderr: false,
-			Tty:          relay.tty,
+			Tty:          true, // Always use TTY for raw TCP relay
 			Cmd:          relay.cmd,
 		}
 
@@ -462,7 +460,6 @@ func (c *SFTPServer) handleDirectTCPIP(sconn *ssh.ServerConn, ch ssh.NewChannel)
 		}
 
 		log.WithField("target", target).WithField("method", relay.cmd[0]).Info("sftp: port forwarding established")
-		usedTty = relay.tty
 		success = true
 		break
 	}
@@ -473,22 +470,14 @@ func (c *SFTPServer) handleDirectTCPIP(sconn *ssh.ServerConn, ch ssh.NewChannel)
 	}
 	defer execAttachResp.Close()
 
-	// Pipe data bidirectionally between SSH channel and Docker exec.
+	// TTY mode: raw byte stream, pipe bidirectionally with io.Copy.
 	done := make(chan struct{})
 
-	if usedTty {
-		// TTY mode: raw byte stream, use io.Copy directly.
-		go func() {
-			io.Copy(channel, execAttachResp.Reader)
-			close(done)
-		}()
-	} else {
-		// Non-TTY mode: Docker multiplexed stream with 8-byte headers.
-		go func() {
-			stdcopy.StdCopy(channel, channel, execAttachResp.Reader)
-			close(done)
-		}()
-	}
+	// Docker exec stdout -> SSH channel
+	go func() {
+		io.Copy(channel, execAttachResp.Reader)
+		close(done)
+	}()
 
 	// SSH channel -> Docker exec stdin
 	go func() {
