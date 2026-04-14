@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -16,11 +17,15 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
+	dockerContainer "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ed25519"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/pelican-dev/wings/config"
+	"github.com/pelican-dev/wings/environment"
+	dockerEnv "github.com/pelican-dev/wings/environment/docker"
 	"github.com/pelican-dev/wings/remote"
 	"github.com/pelican-dev/wings/server"
 )
@@ -127,9 +132,14 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 	go ssh.DiscardRequests(reqs)
 
 	for ch := range chans {
-		// If not a session channel we just move on because it's not something we
-		// know how to handle at this point.
-		if ch.ChannelType() != "session" {
+		switch ch.ChannelType() {
+		case "direct-tcpip":
+			// Handle TCP port forwarding (required by VS Code Remote SSH).
+			go c.handleDirectTCPIP(sconn, ch)
+			continue
+		case "session":
+			// handled below
+		default:
 			_ = ch.Reject(ssh.UnknownChannelType, "unknown channel type")
 			continue
 		}
@@ -344,4 +354,100 @@ func (c *SFTPServer) makeCredentialsRequest(conn ssh.ConnMetadata, t remote.Sftp
 // PrivateKeyPath returns the path the host private key for this server instance.
 func (c *SFTPServer) PrivateKeyPath() string {
 	return path.Join(c.BasePath, ".sftp/id_ed25519")
+}
+
+// handleDirectTCPIP handles SSH direct-tcpip channel requests for port forwarding.
+// This is required by VS Code Remote SSH to connect to the VS Code server running
+// inside the container. It uses Docker exec with bash's /dev/tcp to create a TCP
+// connection inside the container's network namespace.
+func (c *SFTPServer) handleDirectTCPIP(sconn *ssh.ServerConn, ch ssh.NewChannel) {
+	// Parse the direct-tcpip payload per RFC 4254:
+	// string host to connect to, uint32 port, string originator IP, uint32 originator port
+	type directTCPIPRequest struct {
+		Host       string
+		Port       uint32
+		Origin     string
+		OriginPort uint32
+	}
+	var req directTCPIPRequest
+	if err := ssh.Unmarshal(ch.ExtraData(), &req); err != nil {
+		_ = ch.Reject(ssh.Prohibited, "invalid direct-tcpip request")
+		return
+	}
+
+	// Security: only allow localhost connections (inside the container).
+	if req.Host != "127.0.0.1" && req.Host != "localhost" {
+		_ = ch.Reject(ssh.Prohibited, "only localhost forwarding is allowed")
+		return
+	}
+
+	// Accept the channel.
+	channel, reqs, err := ch.Accept()
+	if err != nil {
+		return
+	}
+	defer channel.Close()
+	go ssh.DiscardRequests(reqs)
+
+	// Look up the server for this connection.
+	srv, ok := c.manager.Get(sconn.Permissions.Extensions["uuid"])
+	if !ok {
+		return
+	}
+
+	env, ok := srv.Environment.(*dockerEnv.Environment)
+	if !ok {
+		return
+	}
+
+	cli, err := environment.Docker()
+	if err != nil {
+		return
+	}
+
+	containerID := env.Id
+	target := fmt.Sprintf("%s:%d", req.Host, req.Port)
+
+	log.WithField("target", target).WithField("ip", sconn.RemoteAddr()).Debug("sftp: opening direct-tcpip channel")
+
+	// Use Docker exec with bash /dev/tcp to connect inside the container's network.
+	execConfig := dockerContainer.ExecOptions{
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: false,
+		Tty:          false,
+		Cmd:          []string{"/bin/bash", "-c", fmt.Sprintf("exec 3<>/dev/tcp/%s/%d; cat <&3 & cat >&3; wait", req.Host, req.Port)},
+	}
+
+	execCreateResp, err := cli.ContainerExecCreate(context.Background(), containerID, execConfig)
+	if err != nil {
+		log.WithField("error", err).WithField("target", target).Warn("sftp: failed to create port forwarding exec")
+		return
+	}
+
+	execAttachResp, err := cli.ContainerExecAttach(context.Background(), execCreateResp.ID, dockerContainer.ExecAttachOptions{
+		Detach: false,
+	})
+	if err != nil {
+		log.WithField("error", err).WithField("target", target).Warn("sftp: failed to attach to port forwarding exec")
+		return
+	}
+	defer execAttachResp.Close()
+
+	// Pipe data bidirectionally between SSH channel and Docker exec.
+	done := make(chan struct{})
+
+	// Docker exec stdout -> SSH channel
+	go func() {
+		stdcopy.StdCopy(channel, channel, execAttachResp.Reader)
+		close(done)
+	}()
+
+	// SSH channel -> Docker exec stdin
+	go func() {
+		io.Copy(execAttachResp.Conn, channel)
+		execAttachResp.Close()
+	}()
+
+	<-done
 }
