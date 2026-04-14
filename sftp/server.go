@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/pem"
 	"io"
 	"net"
@@ -138,14 +139,15 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 			continue
 		}
 
-		// sessionState tracks the type of session being requested (SFTP vs shell)
-		// and PTY dimensions for shell sessions.
+		// sessionState tracks the type of session being requested.
 		type sessionState struct {
-			isShell  bool
-			isSftp   bool
-			cols     uint32
-			rows     uint32
+			isShell bool
+			isExec  bool
+			isSftp  bool
+			cols    uint32
+			rows    uint32
 			termType string
+			execCmd string
 		}
 
 		state := &sessionState{}
@@ -153,9 +155,6 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 		resizeCh := make(chan resizeEvent, 8)
 
 		// Handle SSH requests for this channel to determine session type.
-		// For shell sessions this goroutine stays alive for the entire session
-		// to handle "window-change" requests. For SFTP it exits after the
-		// subsystem is detected since no further control requests are expected.
 		go func(in <-chan *ssh.Request, st *sessionState) {
 			for req := range in {
 				switch req.Type {
@@ -174,7 +173,18 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 					st.isShell = true
 					_ = req.Reply(true, nil)
 					close(sessionReady)
-					// Do NOT return — must keep consuming requests for window-change
+				case "exec":
+					// exec request payload: string (length-prefixed) containing the command
+					if len(req.Payload) >= 4 {
+						cmdLen := binary.BigEndian.Uint32(req.Payload[0:4])
+						if int(cmdLen) <= len(req.Payload)-4 {
+							st.execCmd = string(req.Payload[4 : 4+cmdLen])
+						}
+					}
+					st.isExec = true
+					_ = req.Reply(true, nil)
+					close(sessionReady)
+					return
 				case "window-change":
 					cols, rows := parseWindowChange(req.Payload)
 					_ = req.Reply(true, nil)
@@ -188,7 +198,6 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 					_ = req.Reply(false, nil)
 				}
 			}
-			// requests channel closed — session ended
 			close(resizeCh)
 		}(requests, state)
 
@@ -204,6 +213,10 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 			if err := c.HandleShell(sconn, srv, channel, state.cols, state.rows, state.termType, resizeCh); err != nil {
 				return err
 			}
+		} else if state.isExec {
+			if err := c.HandleExec(sconn, srv, channel, state.execCmd); err != nil {
+				return err
+			}
 		} else if state.isSftp {
 			if err := c.Handle(sconn, srv, channel); err != nil {
 				return err
@@ -211,6 +224,13 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 		}
 	}
 	return nil
+}
+
+// HandleExec runs a single command inside the server's container using Docker exec
+// (no TTY). Used by VS Code Remote SSH and similar tools.
+func (c *SFTPServer) HandleExec(conn *ssh.ServerConn, srv *server.Server, channel ssh.Channel, cmd string) error {
+	handler := NewShellHandler(conn, srv, channel)
+	return handler.HandleExec(srv.Context(), cmd)
 }
 
 // HandleShell creates an interactive SSH shell session inside the server's container

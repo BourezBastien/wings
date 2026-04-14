@@ -282,3 +282,95 @@ func parseWindowChange(payload []byte) (cols, rows uint32) {
 	}
 	return
 }
+
+// HandleExec runs a single command inside the server's container using Docker exec
+// without TTY. This is used by VS Code Remote SSH and similar tools that send
+// "exec" requests instead of interactive "shell" sessions.
+func (h *ShellHandler) HandleExec(ctx context.Context, cmd string) error {
+	// Check if shell access is globally enabled.
+	if !config.Get().System.Sftp.ShellEnabled {
+		_, _ = h.channel.Write([]byte("shell access is disabled\r\n"))
+		_ = h.channel.Close()
+		return nil
+	}
+
+	// Check user permission.
+	if !h.can(PermissionTerminalSSH) {
+		_, _ = h.channel.Write([]byte("permission denied\r\n"))
+		_ = h.channel.Close()
+		return nil
+	}
+
+	// Verify the server is running.
+	if !h.srv.IsRunning() {
+		_, _ = h.channel.Write([]byte("server is not running\r\n"))
+		_ = h.channel.Close()
+		return nil
+	}
+
+	env, ok := h.srv.Environment.(*dockerEnv.Environment)
+	if !ok {
+		return errors.New("ssh-exec: environment is not Docker")
+	}
+
+	cli, err := environment.Docker()
+	if err != nil {
+		return errors.Wrap(err, "ssh-exec: failed to get Docker client")
+	}
+
+	containerID := env.Id
+
+	h.logActivity(server.ActivitySSHSessionStart, map[string]interface{}{
+		"exec": cmd,
+	})
+
+	startTime := time.Now()
+	h.logger.WithField("cmd", cmd).Info("ssh-exec: running command")
+
+	// Use bash -c to support pipes, redirects, etc.
+	execConfig := dockerContainer.ExecOptions{
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          false,
+		Cmd:          []string{"/bin/bash", "-c", cmd},
+		WorkingDir:   "/home/container",
+	}
+
+	execCreateResp, err := cli.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return errors.Wrap(err, "ssh-exec: failed to create exec instance")
+	}
+
+	execAttachResp, err := cli.ContainerExecAttach(ctx, execCreateResp.ID, dockerContainer.ExecAttachOptions{
+		Tty:    false,
+		Detach: false,
+	})
+	if err != nil {
+		return errors.Wrap(err, "ssh-exec: failed to attach to exec instance")
+	}
+	defer execAttachResp.Close()
+
+	// Pipe I/O — for non-TTY, stdout and stderr are separate streams.
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		io.Copy(h.channel, execAttachResp.Reader)
+	}()
+
+	go func() {
+		io.Copy(execAttachResp.Conn, h.channel)
+	}()
+
+	<-done
+
+	duration := time.Since(startTime)
+	h.logActivity(server.ActivitySSHSessionEnd, map[string]interface{}{
+		"duration_ms": duration.Milliseconds(),
+		"exec":        cmd,
+	})
+	h.logger.WithField("duration", duration).WithField("cmd", cmd).Info("ssh-exec: command completed")
+
+	return nil
+}
