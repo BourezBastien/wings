@@ -676,7 +676,7 @@ func ConfigurePasswd() (err error) {
 	log.WithField("filepath", filepath.Join(_config.System.User.Passwd.Directory, "passwd")).
 		Debug("ensuring passwd file exists")
 	if err = os.WriteFile(filepath.Join(_config.System.User.Passwd.Directory, "passwd"),
-		[]byte(fmt.Sprintf("container:x:%d:%d::/home/container:/bin/bash",
+		[]byte(fmt.Sprintf("root:x:0:0:root:/root:/bin/bash\ncontainer:x:%d:%d::/home/container:/bin/bash",
 			_config.System.User.Uid, _config.System.User.Gid)), 0644); err != nil {
 		return fmt.Errorf("could not write passwd file: %w", err)
 	}
@@ -684,7 +684,7 @@ func ConfigurePasswd() (err error) {
 	log.WithField("filepath", filepath.Join(_config.System.User.Passwd.Directory, "group")).
 		Debug("ensuring group file exists")
 	if err = os.WriteFile(filepath.Join(_config.System.User.Passwd.Directory, "group"),
-		[]byte(fmt.Sprintf("container:x:%d:container",
+		[]byte(fmt.Sprintf("root:x:0:\ncontainer:x:%d:container",
 			_config.System.User.Gid)), 0644); err != nil {
 		return fmt.Errorf("could not write group file: %w", err)
 	}
