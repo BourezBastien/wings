@@ -11,6 +11,7 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	dockerContainer "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/pkg/stdcopy"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/pelican-dev/wings/config"
@@ -364,10 +365,12 @@ func (h *ShellHandler) HandleExec(ctx context.Context, cmd string) error {
 	stdoutDone := make(chan struct{})
 	stdinDone := make(chan struct{})
 
-	// Docker exec stdout -> SSH channel
+	// Docker exec stdout/stderr -> SSH channel
+	// In non-TTY mode Docker uses a multiplexed stream with 8-byte headers.
+	// stdcopy.StdCopy demuxes stdout and stderr properly.
 	go func() {
 		defer close(stdoutDone)
-		n, _ := io.Copy(h.channel, execAttachResp.Reader)
+		n, _ := stdcopy.StdCopy(h.channel, h.channel, execAttachResp.Reader)
 		h.logger.WithField("bytes_out", n).Info("ssh-exec: stdout copy done")
 	}()
 
