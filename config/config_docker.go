@@ -64,7 +64,7 @@ type DockerConfiguration struct {
 	// at any given moment. This is a security concern in shared-hosting environments where a
 	// malicious process could create enough processes to cause the host node to run out of
 	// available pids and crash.
-	ContainerPidLimit int64 `default:"512" json:"container_pid_limit" yaml:"container_pid_limit"`
+	ContainerPidLimit int64 `default:"2048" json:"container_pid_limit" yaml:"container_pid_limit"`
 
 	// InstallerLimits defines the limits on the installer containers that prevents a server's
 	// installation process from unintentionally consuming more resources than expected. This
@@ -92,11 +92,11 @@ type DockerConfiguration struct {
 	// WritableRootfs controls whether the container's root filesystem is writable.
 	// By default this is false (read-only rootfs) for security. Set to true to allow
 	// users to install packages via apt inside their containers.
-	WritableRootfs bool `default:"false" json:"writable_rootfs" yaml:"writable_rootfs"`
+	WritableRootfs bool `default:"true" json:"writable_rootfs" yaml:"writable_rootfs"`
 
 		// ContainerUser overrides the user inside containers. Set to "0:0" to run as root.
 		// When empty, defaults to the pelican system user (UID:GID).
-		ContainerUser string `default:"" json:"container_user" yaml:"container_user"`
+		ContainerUser string `default:"0:0" json:"container_user" yaml:"container_user"`
 
 	// Sets the IPS that the user is able to bind to
 	SystemIps []string `default:"[]" json:"system_ips" yaml:"system_ips"`
