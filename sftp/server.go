@@ -18,6 +18,7 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	dockerContainer "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ed25519"
@@ -132,6 +133,7 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 	go ssh.DiscardRequests(reqs)
 
 	for ch := range chans {
+		log.WithField("channel_type", ch.ChannelType()).Debug("sftp: received channel open request")
 		switch ch.ChannelType() {
 		case "direct-tcpip":
 			// Handle TCP port forwarding (required by VS Code Remote SSH).
@@ -214,27 +216,32 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 			close(resizeCh)
 		}(requests, state)
 
-		// Wait until the session type is determined.
-		<-sessionReady
+		// Run session handling in a goroutine so the channel loop is not blocked.
+		// This is critical for VS Code Remote SSH which opens direct-tcpip channels
+		// for port forwarding while the exec session is still running.
+		go func() {
+			// Wait until the session type is determined.
+			<-sessionReady
 
-		srv, ok := c.manager.Get(sconn.Permissions.Extensions["uuid"])
-		if !ok {
-			continue
-		}
+			srv, ok := c.manager.Get(sconn.Permissions.Extensions["uuid"])
+			if !ok {
+				return
+			}
 
-		if state.isShell {
-			if err := c.HandleShell(sconn, srv, channel, state.cols, state.rows, state.termType, resizeCh); err != nil {
-				return err
+			if state.isShell {
+				if err := c.HandleShell(sconn, srv, channel, state.cols, state.rows, state.termType, resizeCh); err != nil {
+					log.WithField("error", err).Warn("sftp: shell session error")
+				}
+			} else if state.isExec {
+				if err := c.HandleExec(sconn, srv, channel, state.execCmd); err != nil {
+					log.WithField("error", err).Warn("sftp: exec session error")
+				}
+			} else if state.isSftp {
+				if err := c.Handle(sconn, srv, channel); err != nil {
+					log.WithField("error", err).Warn("sftp: sftp session error")
+				}
 			}
-		} else if state.isExec {
-			if err := c.HandleExec(sconn, srv, channel, state.execCmd); err != nil {
-				return err
-			}
-		} else if state.isSftp {
-			if err := c.Handle(sconn, srv, channel); err != nil {
-				return err
-			}
-		}
+		}()
 	}
 	return nil
 }
@@ -358,8 +365,8 @@ func (c *SFTPServer) PrivateKeyPath() string {
 
 // handleDirectTCPIP handles SSH direct-tcpip channel requests for port forwarding.
 // This is required by VS Code Remote SSH to connect to the VS Code server running
-// inside the container. It uses Docker exec with bash's /dev/tcp to create a TCP
-// connection inside the container's network namespace.
+// inside the container. It uses Docker exec to create a TCP connection inside
+// the container's network namespace.
 func (c *SFTPServer) handleDirectTCPIP(sconn *ssh.ServerConn, ch ssh.NewChannel) {
 	// Parse the direct-tcpip payload per RFC 4254:
 	// string host to connect to, uint32 port, string originator IP, uint32 originator port
@@ -371,19 +378,24 @@ func (c *SFTPServer) handleDirectTCPIP(sconn *ssh.ServerConn, ch ssh.NewChannel)
 	}
 	var req directTCPIPRequest
 	if err := ssh.Unmarshal(ch.ExtraData(), &req); err != nil {
+		log.WithField("error", err).Warn("sftp: failed to parse direct-tcpip request")
 		_ = ch.Reject(ssh.Prohibited, "invalid direct-tcpip request")
 		return
 	}
 
 	// Security: only allow localhost connections (inside the container).
 	if req.Host != "127.0.0.1" && req.Host != "localhost" {
+		log.WithField("host", req.Host).Warn("sftp: rejected non-localhost direct-tcpip request")
 		_ = ch.Reject(ssh.Prohibited, "only localhost forwarding is allowed")
 		return
 	}
 
+	log.WithField("host", req.Host).WithField("port", req.Port).WithField("ip", sconn.RemoteAddr()).Info("sftp: accepting direct-tcpip channel")
+
 	// Accept the channel.
 	channel, reqs, err := ch.Accept()
 	if err != nil {
+		log.WithField("error", err).Warn("sftp: failed to accept direct-tcpip channel")
 		return
 	}
 	defer channel.Close()
@@ -392,44 +404,71 @@ func (c *SFTPServer) handleDirectTCPIP(sconn *ssh.ServerConn, ch ssh.NewChannel)
 	// Look up the server for this connection.
 	srv, ok := c.manager.Get(sconn.Permissions.Extensions["uuid"])
 	if !ok {
+		log.Warn("sftp: server not found for direct-tcpip")
 		return
 	}
 
 	env, ok := srv.Environment.(*dockerEnv.Environment)
 	if !ok {
+		log.Warn("sftp: environment is not docker for direct-tcpip")
 		return
 	}
 
 	cli, err := environment.Docker()
 	if err != nil {
+		log.WithField("error", err).Warn("sftp: failed to get docker client for direct-tcpip")
 		return
 	}
 
 	containerID := env.Id
 	target := fmt.Sprintf("%s:%d", req.Host, req.Port)
 
-	log.WithField("target", target).WithField("ip", sconn.RemoteAddr()).Debug("sftp: opening direct-tcpip channel")
-
-	// Use Docker exec with bash /dev/tcp to connect inside the container's network.
-	execConfig := dockerContainer.ExecOptions{
-		AttachStdin:  true,
-		AttachStdout: true,
-		AttachStderr: false,
-		Tty:          false,
-		Cmd:          []string{"/bin/bash", "-c", fmt.Sprintf("exec 3<>/dev/tcp/%s/%d; cat <&3 & cat >&3; wait", req.Host, req.Port)},
+	// Try multiple approaches for TCP relay inside the container.
+	// Approach 1: nc (netcat) - most reliable for raw TCP relay.
+	// Approach 2: bash /dev/tcp - works on Debian/Ubuntu containers.
+	relays := []struct {
+		cmd []string
+		tty bool
+	}{
+		{[]string{"nc", req.Host, strconv.Itoa(int(req.Port))}, false},
+		{[]string{"/bin/bash", "-c", fmt.Sprintf("exec 3<>/dev/tcp/%s/%d; cat <&3 & cat >&3; wait", req.Host, req.Port)}, true},
 	}
 
-	execCreateResp, err := cli.ContainerExecCreate(context.Background(), containerID, execConfig)
-	if err != nil {
-		log.WithField("error", err).WithField("target", target).Warn("sftp: failed to create port forwarding exec")
-		return
+	var execAttachResp types.HijackedResponse
+	var usedTty bool
+	var success bool
+
+	for _, relay := range relays {
+		execConfig := dockerContainer.ExecOptions{
+			AttachStdin:  true,
+			AttachStdout: true,
+			AttachStderr: false,
+			Tty:          relay.tty,
+			Cmd:          relay.cmd,
+		}
+
+		execCreateResp, err := cli.ContainerExecCreate(context.Background(), containerID, execConfig)
+		if err != nil {
+			log.WithField("error", err).WithField("cmd", relay.cmd).Debug("sftp: port forward exec method failed")
+			continue
+		}
+
+		execAttachResp, err = cli.ContainerExecAttach(context.Background(), execCreateResp.ID, dockerContainer.ExecAttachOptions{
+			Detach: false,
+		})
+		if err != nil {
+			log.WithField("error", err).WithField("cmd", relay.cmd).Debug("sftp: port forward attach method failed")
+			continue
+		}
+
+		log.WithField("target", target).WithField("method", relay.cmd[0]).Info("sftp: port forwarding established")
+		usedTty = relay.tty
+		success = true
+		break
 	}
 
-	execAttachResp, err := cli.ContainerExecAttach(context.Background(), execCreateResp.ID, dockerContainer.ExecAttachOptions{
-		Detach: false,
-	})
-	if err != nil {
-		log.WithField("error", err).WithField("target", target).Warn("sftp: failed to attach to port forwarding exec")
+	if !success {
+		log.WithField("target", target).Error("sftp: all port forwarding methods failed")
 		return
 	}
 	defer execAttachResp.Close()
@@ -437,11 +476,19 @@ func (c *SFTPServer) handleDirectTCPIP(sconn *ssh.ServerConn, ch ssh.NewChannel)
 	// Pipe data bidirectionally between SSH channel and Docker exec.
 	done := make(chan struct{})
 
-	// Docker exec stdout -> SSH channel
-	go func() {
-		stdcopy.StdCopy(channel, channel, execAttachResp.Reader)
-		close(done)
-	}()
+	if usedTty {
+		// TTY mode: raw byte stream, use io.Copy directly.
+		go func() {
+			io.Copy(channel, execAttachResp.Reader)
+			close(done)
+		}()
+	} else {
+		// Non-TTY mode: Docker multiplexed stream with 8-byte headers.
+		go func() {
+			stdcopy.StdCopy(channel, channel, execAttachResp.Reader)
+			close(done)
+		}()
+	}
 
 	// SSH channel -> Docker exec stdin
 	go func() {
@@ -450,4 +497,5 @@ func (c *SFTPServer) handleDirectTCPIP(sconn *ssh.ServerConn, ch ssh.NewChannel)
 	}()
 
 	<-done
+	log.WithField("target", target).Info("sftp: direct-tcpip channel closed")
 }
