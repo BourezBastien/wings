@@ -94,6 +94,10 @@ type DockerConfiguration struct {
 	// users to install packages via apt inside their containers.
 	WritableRootfs bool `default:"false" json:"writable_rootfs" yaml:"writable_rootfs"`
 
+		// ContainerUser overrides the user inside containers. Set to "0:0" to run as root.
+		// When empty, defaults to the pelican system user (UID:GID).
+		ContainerUser string `default:"" json:"container_user" yaml:"container_user"`
+
 	// Sets the IPS that the user is able to bind to
 	SystemIps []string `default:"[]" json:"system_ips" yaml:"system_ips"`
 

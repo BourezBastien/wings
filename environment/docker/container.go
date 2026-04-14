@@ -193,7 +193,9 @@ func (e *Environment) Create() error {
 	}
 
 	// Set the user running the container properly depending on what mode we are operating in.
-	if cfg.System.User.Rootless.Enabled {
+	if cfg.Docker.ContainerUser != "" {
+		conf.User = cfg.Docker.ContainerUser
+	} else if cfg.System.User.Rootless.Enabled {
 		conf.User = fmt.Sprintf("%d:%d", cfg.System.User.Rootless.ContainerUID, cfg.System.User.Rootless.ContainerGID)
 	} else {
 		conf.User = strconv.Itoa(cfg.System.User.Uid) + ":" + strconv.Itoa(cfg.System.User.Gid)
