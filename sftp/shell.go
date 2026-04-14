@@ -166,7 +166,7 @@ func (h *ShellHandler) Handle(ctx context.Context, initialCols, initialRows uint
 
 	// Attach to the exec instance.
 	execAttachResp, err := cli.ContainerExecAttach(ctx, execCreateResp.ID, dockerContainer.ExecAttachOptions{
-		Tty:    true,
+		Tty:    false,
 		Detach: false,
 	})
 	if err != nil {
@@ -327,13 +327,22 @@ func (h *ShellHandler) HandleExec(ctx context.Context, cmd string) error {
 	startTime := time.Now()
 	h.logger.WithField("cmd", cmd).Info("ssh-exec: running command")
 
-	// Use sh -c with TTY for proper bidirectional I/O (required by VS Code Remote SSH).
+	// Run the command directly in the container.
+	// For simple shell names (sh, bash), run them directly to preserve stdin behavior.
+	// For other commands, wrap in sh -c.
+	var execCmd []string
+	switch cmd {
+	case "sh", "bash", "/bin/sh", "/bin/bash", "zsh":
+		execCmd = []string{cmd}
+	default:
+		execCmd = []string{"/bin/sh", "-c", cmd}
+	}
 	execConfig := dockerContainer.ExecOptions{
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
-		Tty:          true,
-		Cmd:          []string{"/bin/sh", "-c", cmd},
+		Tty:          false,
+		Cmd:          execCmd,
 		WorkingDir:   "/home/container",
 	}
 
@@ -343,7 +352,7 @@ func (h *ShellHandler) HandleExec(ctx context.Context, cmd string) error {
 	}
 
 	execAttachResp, err := cli.ContainerExecAttach(ctx, execCreateResp.ID, dockerContainer.ExecAttachOptions{
-		Tty:    true,
+		Tty:    false,
 		Detach: false,
 	})
 	if err != nil {
@@ -359,14 +368,14 @@ func (h *ShellHandler) HandleExec(ctx context.Context, cmd string) error {
 	go func() {
 		defer close(stdoutDone)
 		n, _ := io.Copy(h.channel, execAttachResp.Reader)
-		h.logger.WithField("bytes_out", n).Debug("ssh-exec: stdout copy done")
+		h.logger.WithField("bytes_out", n).Info("ssh-exec: stdout copy done")
 	}()
 
 	// SSH channel stdin -> Docker exec stdin
 	go func() {
 		defer close(stdinDone)
 		n, _ := io.Copy(execAttachResp.Conn, h.channel)
-		h.logger.WithField("bytes_in", n).Debug("ssh-exec: stdin copy done")
+		h.logger.WithField("bytes_in", n).Info("ssh-exec: stdin copy done")
 		// Signal EOF to the container process so it knows stdin is closed.
 		if cw, ok := execAttachResp.Conn.(interface{ CloseWrite() error }); ok {
 			cw.CloseWrite()
