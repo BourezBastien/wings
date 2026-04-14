@@ -90,7 +90,7 @@ func (h *ShellHandler) logActivity(event models.Event, metadata map[string]inter
 //  3. Pipe I/O between SSH channel and Docker exec
 //  4. Handle PTY resize requests via resizeCh
 //  5. Clean up on disconnect
-func (h *ShellHandler) Handle(ctx context.Context, initialCols, initialRows uint32, resizeCh <-chan resizeEvent) error {
+func (h *ShellHandler) Handle(ctx context.Context, initialCols, initialRows uint32, termType string, resizeCh <-chan resizeEvent) error {
 	// Check if shell access is globally enabled.
 	if !config.Get().System.Sftp.ShellEnabled {
 		h.logger.Warn("ssh-shell: shell access is disabled in Wings configuration")
@@ -143,6 +143,11 @@ func (h *ShellHandler) Handle(ctx context.Context, initialCols, initialRows uint
 	shellCtx := h.srv.Shell().Context(user)
 	defer h.srv.Shell().Cancel(user)
 
+	// Build environment variables for the exec session.
+	execEnv := []string{
+		"TERM=" + termType,
+	}
+
 	// Create Docker exec instance with TTY.
 	execConfig := dockerContainer.ExecOptions{
 		AttachStdin:  true,
@@ -151,6 +156,7 @@ func (h *ShellHandler) Handle(ctx context.Context, initialCols, initialRows uint
 		Tty:          true,
 		Cmd:          []string{shellPath},
 		WorkingDir:   "/home/container",
+		Env:          execEnv,
 	}
 
 	execCreateResp, err := cli.ContainerExecCreate(ctx, containerID, execConfig)
@@ -221,16 +227,50 @@ func (h *ShellHandler) Handle(ctx context.Context, initialCols, initialRows uint
 	return nil
 }
 
-// parsePtyDimensions parses the PTY request payload to extract columns and rows.
-// The SSH PTY request payload format is:
-//   uint32  terminal-width (columns)
-//   uint32  terminal-height (rows)
-//   uint32  terminal-width-pixels
-//   uint32  terminal-height-pixels
-//   string  terminal-mode
-func parsePtyDimensions(payload []byte) (cols, rows uint32) {
+// parsePtyRequest parses the SSH "pty-req" payload.
+// Format per RFC 4254:
+//
+//	string   TERM environment variable value (e.g., "xterm-256color")
+//	uint32   terminal width, columns
+//	uint32   terminal height, rows
+//	uint32   terminal width, pixels
+//	uint32   terminal height, pixels
+//	string   encoded terminal modes
+func parsePtyRequest(payload []byte) (term string, cols, rows uint32) {
+	if len(payload) < 4 {
+		return "xterm", 80, 24
+	}
+	// Read the TERM string (length-prefixed).
+	termLen := binary.BigEndian.Uint32(payload[0:4])
+	offset := 4 + int(termLen)
+	if len(payload) < offset+8 {
+		return "xterm", 80, 24
+	}
+	term = string(payload[4 : 4+termLen])
+	if term == "" {
+		term = "xterm"
+	}
+	cols = binary.BigEndian.Uint32(payload[offset : offset+4])
+	rows = binary.BigEndian.Uint32(payload[offset+4 : offset+8])
+	if cols == 0 {
+		cols = 80
+	}
+	if rows == 0 {
+		rows = 24
+	}
+	return
+}
+
+// parseWindowChange parses a "window-change" request payload.
+// Format per RFC 4254:
+//
+//	uint32   terminal width, columns
+//	uint32   terminal height, rows
+//	uint32   terminal width, pixels
+//	uint32   terminal height, pixels
+func parseWindowChange(payload []byte) (cols, rows uint32) {
 	if len(payload) < 8 {
-		return 80, 24 // default fallback
+		return 80, 24
 	}
 	cols = binary.BigEndian.Uint32(payload[0:4])
 	rows = binary.BigEndian.Uint32(payload[4:8])
@@ -241,10 +281,4 @@ func parsePtyDimensions(payload []byte) (cols, rows uint32) {
 		rows = 24
 	}
 	return
-}
-
-// parseWindowChange parses a window-change request payload.
-// Same format as PTY dimensions (first 8 bytes).
-func parseWindowChange(payload []byte) (cols, rows uint32) {
-	return parsePtyDimensions(payload)
 }

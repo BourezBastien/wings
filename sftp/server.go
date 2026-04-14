@@ -141,10 +141,11 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 		// sessionState tracks the type of session being requested (SFTP vs shell)
 		// and PTY dimensions for shell sessions.
 		type sessionState struct {
-			isShell bool
-			isSftp  bool
-			cols    uint32
-			rows    uint32
+			isShell  bool
+			isSftp   bool
+			cols     uint32
+			rows     uint32
+			termType string
 		}
 
 		state := &sessionState{}
@@ -167,7 +168,7 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 					}
 					_ = req.Reply(false, nil)
 				case "pty-req":
-					st.cols, st.rows = parsePtyDimensions(req.Payload)
+					st.termType, st.cols, st.rows = parsePtyRequest(req.Payload)
 					_ = req.Reply(true, nil)
 				case "shell":
 					st.isShell = true
@@ -200,7 +201,7 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 		}
 
 		if state.isShell {
-			if err := c.HandleShell(sconn, srv, channel, state.cols, state.rows, resizeCh); err != nil {
+			if err := c.HandleShell(sconn, srv, channel, state.cols, state.rows, state.termType, resizeCh); err != nil {
 				return err
 			}
 		} else if state.isSftp {
@@ -214,9 +215,9 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 
 // HandleShell creates an interactive SSH shell session inside the server's container
 // using Docker exec with PTY allocation.
-func (c *SFTPServer) HandleShell(conn *ssh.ServerConn, srv *server.Server, channel ssh.Channel, cols, rows uint32, resizeCh <-chan resizeEvent) error {
+func (c *SFTPServer) HandleShell(conn *ssh.ServerConn, srv *server.Server, channel ssh.Channel, cols, rows uint32, termType string, resizeCh <-chan resizeEvent) error {
 	handler := NewShellHandler(conn, srv, channel)
-	return handler.Handle(srv.Context(), cols, rows, resizeCh)
+	return handler.Handle(srv.Context(), cols, rows, termType, resizeCh)
 }
 
 // Handle spins up a SFTP server instance for the authenticated user's server allowing
