@@ -30,11 +30,15 @@ func (s *Server) Mounts() []environment.Mount {
 		},
 	}
 
+	// When running as root, passwd/group must be writable so apt and other
+	// tools can create lock files inside the container.
+	passwdReadOnly := config.Get().Docker.ContainerUser != "0:0" && config.Get().Docker.ContainerUser != "0"
+
 	if config.Get().System.User.Passwd.Enable {
 		passwdMount := environment.Mount{
 			Target:   "/etc/passwd",
 			Source:   filepath.Join(config.Get().System.User.Passwd.Directory, "passwd"),
-			ReadOnly: true,
+			ReadOnly: passwdReadOnly,
 		}
 
 		m = append(m, passwdMount)
@@ -42,7 +46,7 @@ func (s *Server) Mounts() []environment.Mount {
 		groupMount := environment.Mount{
 			Target:   "/etc/group",
 			Source:   filepath.Join(config.Get().System.User.Passwd.Directory, "group"),
-			ReadOnly: true,
+			ReadOnly: passwdReadOnly,
 		}
 
 		m = append(m, groupMount)

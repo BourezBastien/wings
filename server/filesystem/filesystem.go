@@ -208,8 +208,7 @@ func (fs *Filesystem) chownFile(name string) error {
 		return nil
 	}
 
-	uid := config.Get().System.User.Uid
-	gid := config.Get().System.User.Gid
+	uid, gid := config.Get().Docker.ContainerFileOwner()
 	return fs.unixFS.Lchown(name, uid, gid)
 }
 
@@ -222,8 +221,7 @@ func (fs *Filesystem) Chown(p string) error {
 		return nil
 	}
 
-	uid := config.Get().System.User.Uid
-	gid := config.Get().System.User.Gid
+	uid, gid := config.Get().Docker.ContainerFileOwner()
 
 	dirfd, name, closeFd, err := fs.unixFS.SafePath(p)
 	defer closeFd()
@@ -348,7 +346,8 @@ func (fs *Filesystem) Copy(p string) error {
 	fs.unixFS.Add(n)
 
 	if !fs.isTest {
-		if err := fs.unixFS.Lchownat(dirfd, newName, config.Get().System.User.Uid, config.Get().System.User.Gid); err != nil {
+		uid, gid := config.Get().Docker.ContainerFileOwner()
+		if err := fs.unixFS.Lchownat(dirfd, newName, uid, gid); err != nil {
 			return err
 		}
 	}

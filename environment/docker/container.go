@@ -261,20 +261,30 @@ func (e *Environment) Create() error {
 		// about anything else in it.
 		LogConfig: cfg.Docker.ContainerLogConfig(),
 
-		// Disable no-new-privileges when writable rootfs is enabled so that
-		// sudo works inside containers (e.g. for apt install).
+		// When running as root (container_user: "0:0"), disable all security
+		// restrictions so apt/sudo/package management works inside the container.
 		SecurityOpt: func() []string {
-			if config.Get().Docker.WritableRootfs {
+			cu := config.Get().Docker.ContainerUser
+			if cu == "0:0" || cu == "0" || config.Get().Docker.WritableRootfs {
 				return nil
 			}
 			return []string{"no-new-privileges"}
 		}(),
-		ReadonlyRootfs: !config.Get().Docker.WritableRootfs,
-		CapDrop: []string{
-			"setpcap", "mknod", "audit_write", "net_raw", "dac_override",
-			"fowner", "fsetid", "net_bind_service", "sys_chroot", "setfcap",
-			"sys_ptrace",
-		},
+		ReadonlyRootfs: func() bool {
+			cu := config.Get().Docker.ContainerUser
+			return cu != "0:0" && cu != "0" && !config.Get().Docker.WritableRootfs
+		}(),
+		CapDrop: func() []string {
+			cu := config.Get().Docker.ContainerUser
+			if cu == "0:0" || cu == "0" {
+				return nil
+			}
+			return []string{
+				"setpcap", "mknod", "audit_write", "net_raw", "dac_override",
+				"fowner", "fsetid", "net_bind_service", "sys_chroot", "setfcap",
+				"sys_ptrace",
+			}
+		}(),
 		NetworkMode: networkMode,
 		UsernsMode:  container.UsernsMode(cfg.Docker.UsernsMode),
 	}

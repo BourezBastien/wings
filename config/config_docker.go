@@ -196,3 +196,13 @@ func (o Overhead) GetMultiplier(memoryLimit int64) float64 {
 
 	return o.DefaultMultiplier
 }
+
+// ContainerFileOwner returns the UID and GID that should own files inside containers.
+// When ContainerUser is set to "0:0", returns (0, 0) for root ownership.
+// Otherwise returns the system pelican user UID/GID.
+func (c DockerConfiguration) ContainerFileOwner() (int, int) {
+	if c.ContainerUser == "0:0" || c.ContainerUser == "0" {
+		return 0, 0
+	}
+	return Get().System.User.Uid, Get().System.User.Gid
+}
