@@ -259,7 +259,14 @@ func (e *Environment) Create() error {
 		// about anything else in it.
 		LogConfig: cfg.Docker.ContainerLogConfig(),
 
-		SecurityOpt:    []string{"no-new-privileges"},
+		// Disable no-new-privileges when writable rootfs is enabled so that
+		// sudo works inside containers (e.g. for apt install).
+		SecurityOpt: func() []string {
+			if config.Get().Docker.WritableRootfs {
+				return nil
+			}
+			return []string{"no-new-privileges"}
+		}(),
 		ReadonlyRootfs: !config.Get().Docker.WritableRootfs,
 		CapDrop: []string{
 			"setpcap", "mknod", "audit_write", "net_raw", "dac_override",
