@@ -115,6 +115,10 @@ func (l Limits) AsContainerResources() container.Resources {
 		BlkioWeight:       l.IoWeight,
 		OomKillDisable:    boolPtr(!l.OOMKiller),
 		PidsLimit:         &pids,
+		Ulimits: []*container.Ulimit{
+			{Name: "nofile", Hard: 65536, Soft: 65536},
+			{Name: "core", Hard: 0, Soft: 0},
+		},
 	}
 
 	// If the CPU Limit is not set, don't send any of these fields through. Providing

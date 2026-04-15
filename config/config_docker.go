@@ -37,7 +37,7 @@ type DockerNetworkConfiguration struct {
 	Driver     string                  `default:"bridge"`
 	Mode       string                  `default:"pelican_nw" yaml:"network_mode"`
 	IsInternal bool                    `default:"false" yaml:"is_internal"`
-	EnableICC  bool                    `default:"true" yaml:"enable_icc"`
+	EnableICC  bool                    `default:"false" yaml:"enable_icc"`
 	NetworkMTU int64                   `default:"1500" yaml:"network_mtu"`
 	Interfaces dockerNetworkInterfaces `yaml:"interfaces"`
 }

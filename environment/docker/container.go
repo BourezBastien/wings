@@ -261,30 +261,19 @@ func (e *Environment) Create() error {
 		// about anything else in it.
 		LogConfig: cfg.Docker.ContainerLogConfig(),
 
-		// When running as root (container_user: "0:0"), disable all security
-		// restrictions so apt/sudo/package management works inside the container.
-		SecurityOpt: func() []string {
-			cu := config.Get().Docker.ContainerUser
-			if cu == "0:0" || cu == "0" || config.Get().Docker.WritableRootfs {
-				return nil
-			}
-			return []string{"no-new-privileges"}
-		}(),
+		// Security hardening: always apply restrictions, even for root containers.
+		// Drop ALL capabilities then add back only what's needed for apt/install,
+		// package management, and game server operation. Prevents container escapes.
+		SecurityOpt: []string{"no-new-privileges"},
 		ReadonlyRootfs: func() bool {
-			cu := config.Get().Docker.ContainerUser
-			return cu != "0:0" && cu != "0" && !config.Get().Docker.WritableRootfs
+			return !config.Get().Docker.WritableRootfs
 		}(),
-		CapDrop: func() []string {
-			cu := config.Get().Docker.ContainerUser
-			if cu == "0:0" || cu == "0" {
-				return nil
-			}
-			return []string{
-				"setpcap", "mknod", "audit_write", "net_raw", "dac_override",
-				"fowner", "fsetid", "net_bind_service", "sys_chroot", "setfcap",
-				"sys_ptrace",
-			}
-		}(),
+		CapDrop: []string{"ALL"},
+		CapAdd: []string{
+			"chown", "dac_override", "fowner", "fsetid",
+			"kill", "setgid", "setuid", "setpcap",
+			"net_bind_service", "sys_chroot", "audit_write",
+		},
 		NetworkMode: networkMode,
 		UsernsMode:  container.UsernsMode(cfg.Docker.UsernsMode),
 	}
